@@ -1,6 +1,8 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { badRequest, errorBody, parseOptionalInt, maxProjectId } from "../middleware/errors";
 import { recordAudit, getAuditLog, auditToCsv } from "../lib/audit";
+import { writeAuditLog } from "../lib/audit-logger";
+import { getCorrelationId } from "../lib/correlation";
 import { broadcastScoreUpdate } from "../lib/websocket";
 import { tryBeginUpdate, markCompleted, markFailed } from "../lib/duplicate-detection";
 import { withProjectLock } from "../lib/request-queue";
@@ -10,6 +12,7 @@ import { logger } from "../lib/logger";
 import { config } from "../config";
 import { requireApiKeyRole, extractApiKeyRole } from "../middleware/requireApiKeyRole";
 import { timingSafeCompare } from "../lib/timing-safe";
+import { parseContractError } from "../lib/contractErrors";
 
 const router = Router();
 
@@ -157,10 +160,32 @@ function parseProjectIds(body: unknown): number[] | null {
 // forwarded to the central errorHandler via next() so status codes stay consistent
 // across all endpoints. The nested per-project catch is intentional: it collects
 // partial failures without aborting the entire batch.
+function auditUpdateScores(
+  req: Request,
+  projectIds: number[],
+  outcome: {
+    success: boolean;
+    results?: unknown;
+    error?: string;
+    contract_error_name?: string;
+    contract_error_code?: number;
+  },
+): void {
+  writeAuditLog({
+    action: "admin.update-scores",
+    correlation_id: getCorrelationId(),
+    ip: req.ip ?? null,
+    user_agent: req.get("user-agent") ?? null,
+    project_ids: projectIds,
+    ...outcome,
+  });
+}
+
 router.post(
   "/update-scores",
   requireApiKeyRole("admin:write"),
   async (req: Request, res: Response, next: NextFunction) => {
+    let auditedIds: number[] = [];
     try {
       const requested = parseProjectIds(req.body);
       let projectIds: number[];
@@ -171,9 +196,18 @@ router.post(
         const total = await getTotalProjects();
         projectIds = Array.from({ length: total }, (_, i) => i + 1);
       }
+      auditedIds = projectIds;
 
       const results: ScoreUpdateResult[] = [];
-      const errors: Array<{ project_id: number; error: { code: string; message: string } }> = [];
+      const errors: Array<{
+        project_id: number;
+        error: {
+          code: string;
+          message: string;
+          contract_error_name?: string;
+          contract_error_code?: number;
+        };
+      }> = [];
       const skipped: Array<{ project_id: number; reason: string }> = [];
 
       for (const projectId of projectIds) {
@@ -196,6 +230,11 @@ router.post(
                   credit_quality: scoreResult.creditQuality,
                   green_impact: scoreResult.greenImpact,
                 };
+              }
+
+              if (scoreResult.status === "skipped") {
+                markCompleted(projectId);
+                return { skipped: true, reason: scoreResult.reason };
               }
 
               if (scoreResult.status === "error") {
@@ -249,18 +288,38 @@ router.post(
           }
         } catch (err) {
           logger.error(`[oracle] project ${projectId} failed`, logger.formatError(err));
+          const decoded = parseContractError(err);
           errors.push({
             project_id: projectId,
             error: {
               code: "update_failed",
               message: err instanceof Error ? err.message : String(err),
+              ...(decoded
+                ? { contract_error_name: decoded.name, contract_error_code: decoded.code }
+                : {}),
             },
           });
         }
       }
 
+      auditUpdateScores(req, projectIds, {
+        success: errors.length === 0,
+        results: {
+          updated: results.map((r) => r.project_id),
+          failed: errors.map((e) => e.project_id),
+          skipped: skipped.map((k) => k.project_id),
+        },
+      });
       res.json({ updated: results.length, results, errors, skipped });
     } catch (error) {
+      const decoded = parseContractError(error);
+      auditUpdateScores(req, auditedIds, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(decoded
+          ? { contract_error_name: decoded.name, contract_error_code: decoded.code }
+          : {}),
+      });
       next(error);
     }
   },
